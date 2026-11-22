@@ -9,6 +9,7 @@ from torch_sparse import SparseTensor
 import torch_sparse
 from torch_scatter import scatter_add
 from typing import Iterable, Final
+from sna_community import get_triadic_features
 
 # a vanilla message passing layer 
 class PureConv(nn.Module):
@@ -420,7 +421,15 @@ class IncompleteSCN1Predictor(SCNLinkPredictor):
         self.trainresdeg = trainresdeg
         self.testresdeg = testresdeg
         self.ptlin = nn.Sequential(nn.Linear(hidden_channels, hidden_channels), nn.ReLU(inplace=True), nn.Linear(hidden_channels, 1), nn.Sigmoid())
-        # print(self.xcnlin)
+        # Seven triadic SNA features -> reliability multiplier in (0, 2).
+        self.community_gate = nn.Sequential(
+            nn.Linear(7, hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_channels, 1)
+        )
+        # Start with gate = 1 so TCR-NCNC initially matches NCNC.
+        nn.init.zeros_(self.community_gate[-1].weight)
+        nn.init.zeros_(self.community_gate[-1].bias)
 
     def clampprob(self, prob, pt):
         p0 = torch.sigmoid_(self.scale*(prob-self.offset))
@@ -432,7 +441,8 @@ class IncompleteSCN1Predictor(SCNLinkPredictor):
                            tar_ei,
                            filled1: bool = False,
                            cndropprobs: Iterable[float] = [],
-                           depth: int=None):
+                           depth: int=None,
+                           community=None):
         assert len(cndropprobs) == 0
         if depth is None:
             depth = self.depth
@@ -468,22 +478,22 @@ class IncompleteSCN1Predictor(SCNLinkPredictor):
                     ei1 = torch.stack((tar_ei[1][potcn1[0]], potcn1[1]))
                     probcn1 = self.forward(
                         x, adj, ei1,
-                        filled1, depth-1).flatten()
+                        filled1, depth-1, community).flatten()
                     ei2 = torch.stack((tar_ei[0][potcn2[0]], potcn2[1]))
                     probcn2 = self.forward(
                         x, adj, ei2,
-                        filled1, depth-1).flatten()
+                        filled1, depth-1, community).flatten()
                 else:
                     num1 = potcn1[1].shape[0]
                     ei1 = torch.stack((tar_ei[1][potcn1[0]], potcn1[1]))
                     probcn1 = torch.empty_like(potcn1[1], dtype=torch.float)
                     for i in range(0, num1, self.splitsize):
-                        probcn1[i:i+self.splitsize] = self.forward(x, adj, ei1[:, i: i+self.splitsize], filled1, depth-1).flatten()
+                        probcn1[i:i+self.splitsize] = self.forward(x, adj, ei1[:, i: i+self.splitsize], filled1, depth-1, community).flatten()
                     num2 = potcn2[1].shape[0]
                     ei2 = torch.stack((tar_ei[0][potcn2[0]], potcn2[1]))
                     probcn2 = torch.empty_like(potcn2[1], dtype=torch.float)
                     for i in range(0, num2, self.splitsize):
-                        probcn2[i:i+self.splitsize] = self.forward(x, adj, ei2[:, i: i+self.splitsize],filled1, depth-1).flatten()
+                        probcn2[i:i+self.splitsize] = self.forward(x, adj, ei2[:, i: i+self.splitsize],filled1, depth-1, community).flatten()
             if self.learnablept:
                 pt = self.ptlin(xij)
                 probcn1 = self.clampprob(probcn1, pt[potcn1[0]]) 
@@ -491,6 +501,29 @@ class IncompleteSCN1Predictor(SCNLinkPredictor):
             else:
                 probcn1 = self.clampprob(probcn1, self.pt)
                 probcn2 = self.clampprob(probcn2, self.pt)
+            if community is not None:
+
+                # Candidate common neighbors for missing edge (j, u)
+                i1 = tar_ei[0][potcn1[0]]
+                j1 = tar_ei[1][potcn1[0]]
+                u1 = potcn1[1]
+
+                gate1 = self.calculate_community_gate(
+                    i1, j1, u1, community
+                )
+
+                # Candidate common neighbors for missing edge (i, u)
+                i2 = tar_ei[0][potcn2[0]]
+                j2 = tar_ei[1][potcn2[0]]
+                u2 = potcn2[1]
+
+                gate2 = self.calculate_community_gate(
+                    i2, j2, u2, community
+                )
+
+                probcn1 = probcn1 * gate1
+                probcn2 = probcn2 * gate2
+
             probcn1 = probcn1 * potcn1[-1]
             probcn2 = probcn2 * potcn2[-1]
             cnres1.set_value_(probcn1, layout="coo")
@@ -514,11 +547,17 @@ class IncompleteSCN1Predictor(SCNLinkPredictor):
                 adj,
                 tar_ei,
                 filled1: bool = False,
-                depth: int = None):
+                depth: int = None,
+                community=None):
         if depth is None:
             depth = self.depth
         return self.multidomainforward(x, adj, tar_ei, filled1, [],
-                                       depth)
+                                       depth, community)
+
+    def calculate_community_gate(self, i, j, u, community):
+        features = get_triadic_features(i, j, u, community)
+        gate = 2.0 * torch.sigmoid(self.community_gate(features))
+        return gate.flatten()
 
 
 # NCN predictor
@@ -570,11 +609,13 @@ class CNLinkPredictor(nn.Module):
         self.cndeg = cndeg
 
     def multidomainforward(self,
-                           x,
-                           adj,
-                           tar_ei,
-                           filled1: bool = False,
-                           cndropprobs: Iterable[float] = []):
+                            x,
+                            adj,
+                            tar_ei,
+                            filled1: bool = False,
+                            cndropprobs: Iterable[float] = [],
+                            depth: int = None,
+                            community=None):
         adj = self.dropadj(adj)
         xi = x[tar_ei[0]]
         xj = x[tar_ei[1]]
@@ -588,8 +629,10 @@ class CNLinkPredictor(nn.Module):
             dim=-1)
         return xs
 
-    def forward(self, x, adj, tar_ei, filled1: bool = False):
-        return self.multidomainforward(x, adj, tar_ei, filled1, [])
+    def forward( self,x,adj,tar_ei,filled1: bool = False,depth: int = None,community=None):
+        if depth is None:
+            depth = self.depth
+        return self.multidomainforward(x,adj,tar_ei,filled1,[],depth,community)
 
 # GAE predictor for ablation study
 class CN0LinkPredictor(nn.Module):
@@ -746,12 +789,20 @@ class IncompleteCN1Predictor(CNLinkPredictor):
                 if self.splitsize < 0:
                     ei1 = torch.stack((tar_ei[1][potcn1[0]], potcn1[1]))
                     probcn1 = self.forward(
-                        x, adj, ei1,
-                        filled1, depth-1).flatten()
+                        x,
+                        adj,
+                        ei1,
+                        filled1,
+                        depth - 1,
+                        community).flatten()
                     ei2 = torch.stack((tar_ei[0][potcn2[0]], potcn2[1]))
                     probcn2 = self.forward(
-                        x, adj, ei2,
-                        filled1, depth-1).flatten()
+                        x,
+                        adj,
+                        ei2,
+                        filled1,
+                        depth - 1,
+                        community).flatten()
                 else:
                     num1 = potcn1[1].shape[0]
                     ei1 = torch.stack((tar_ei[1][potcn1[0]], potcn1[1]))
@@ -977,5 +1028,6 @@ predictor_dict = {
     "cn1.5": CNhalf2LinkPredictor,
     "cn1res": CNResLinkPredictor,
     "cn2": CN2LinkPredictor,
-    "incn1cn1": IncompleteCN1Predictor
+    "incn1cn1": IncompleteCN1Predictor,
+    "tcrncnc": IncompleteSCN1Predictor
 }

@@ -1,4 +1,5 @@
 import torch
+from contextlib import contextmanager
 from sklearn.metrics import roc_auc_score, average_precision_score
 from ogb.linkproppred import PygLinkPropPredDataset
 import torch_geometric.transforms as T
@@ -6,6 +7,22 @@ from torch_sparse import SparseTensor
 from torch_geometric.datasets import Planetoid
 from torch_geometric.utils import train_test_split_edges, negative_sampling, to_undirected
 from torch_geometric.transforms import RandomLinkSplit
+
+# OGB's PyG loader calls torch.load without weights_only, and PyTorch >= 2.6 defaults it to True,
+# which rejects the PyG/numpy objects in OGB's own cache. Trusted local OGB files only.
+@contextmanager
+def _ogb_torch_load():
+    original_load = torch.load
+
+    def load(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return original_load(*args, **kwargs)
+
+    torch.load = load
+    try:
+        yield
+    finally:
+        torch.load = original_load
 
 # random split dataset
 def randomsplit(dataset, val_ratio: float=0.10, test_ratio: float=0.2):
@@ -35,8 +52,9 @@ def loaddataset(name: str, use_valedges_as_input: bool, load=None):
         edge_index = data.edge_index
         data.num_nodes = data.x.shape[0]
     else:
-        dataset = PygLinkPropPredDataset(name=f'ogbl-{name}')
-        split_edge = dataset.get_edge_split()
+        with _ogb_torch_load():
+            dataset = PygLinkPropPredDataset(name=f'ogbl-{name}')
+            split_edge = dataset.get_edge_split()
         data = dataset[0]
         edge_index = data.edge_index
     data.edge_weight = None 

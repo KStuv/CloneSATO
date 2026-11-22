@@ -15,7 +15,7 @@ from utils import PermIterator
 import time
 from ogbdataset import loaddataset
 from typing import Iterable
-
+from sna_community import build_sna_community
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -31,7 +31,8 @@ def train(model,
           batch_size,
           maskinput: bool = True,
           cnprobs: Iterable[float]=[],
-          alpha: float=None):
+          alpha: float=None,
+          community=None):
     
     if alpha is not None:
         predictor.setalpha(alpha)
@@ -62,14 +63,21 @@ def train(model,
             adj = data.adj_t
         h = model(data.x, adj)
         edge = pos_train_edge[:, perm]
-        pos_outs = predictor.multidomainforward(h,
-                                                    adj,
-                                                    edge,
-                                                    cndropprobs=cnprobs)
+        if community is not None:
+            pos_outs = predictor.multidomainforward(
+                h, adj, edge, cndropprobs=cnprobs, community=community)
+        else:
+            pos_outs = predictor.multidomainforward(
+                h, adj, edge, cndropprobs=cnprobs)
 
         pos_losss = -F.logsigmoid(pos_outs).mean()
         edge = negedge[:, perm]
-        neg_outs = predictor.multidomainforward(h, adj, edge, cndropprobs=cnprobs)
+        if community is not None:
+            neg_outs = predictor.multidomainforward(
+                h, adj, edge, cndropprobs=cnprobs, community=community)
+        else:
+            neg_outs = predictor.multidomainforward(
+                h, adj, edge, cndropprobs=cnprobs)
         neg_losss = -F.logsigmoid(-neg_outs).mean()
         loss = neg_losss + pos_losss
         loss.backward()
@@ -82,7 +90,7 @@ def train(model,
 
 @torch.no_grad()
 def test(model, predictor, data, split_edge, evaluator, batch_size,
-         use_valedges_as_input):
+         use_valedges_as_input,community=None):
     model.eval()
     predictor.eval()
 
@@ -96,8 +104,13 @@ def test(model, predictor, data, split_edge, evaluator, batch_size,
     h = model(data.x, adj)
 
     
+    def predict_edges(edges):
+        if community is not None:
+            return predictor(h, adj, edges, community=community)
+        return predictor(h, adj, edges)
+
     pos_train_pred = torch.cat([
-        predictor(h, adj, pos_train_edge[perm].t()).squeeze().cpu()
+        predict_edges(pos_train_edge[perm].t()).squeeze().cpu()
         for perm in PermIterator(pos_train_edge.device,
                                  pos_train_edge.shape[0], batch_size, False)
     ],
@@ -105,13 +118,13 @@ def test(model, predictor, data, split_edge, evaluator, batch_size,
 
 
     pos_valid_pred = torch.cat([
-        predictor(h, adj, pos_valid_edge[perm].t()).squeeze().cpu()
+        predict_edges(pos_valid_edge[perm].t()).squeeze().cpu()
         for perm in PermIterator(pos_valid_edge.device,
                                  pos_valid_edge.shape[0], batch_size, False)
     ],
                                dim=0)
     neg_valid_pred = torch.cat([
-        predictor(h, adj, neg_valid_edge[perm].t()).squeeze().cpu()
+        predict_edges(neg_valid_edge[perm].t()).squeeze().cpu()
         for perm in PermIterator(neg_valid_edge.device,
                                  neg_valid_edge.shape[0], batch_size, False)
     ],
@@ -121,14 +134,14 @@ def test(model, predictor, data, split_edge, evaluator, batch_size,
         h = model(data.x, adj)
 
     pos_test_pred = torch.cat([
-        predictor(h, adj, pos_test_edge[perm].t()).squeeze().cpu()
+        predict_edges(pos_test_edge[perm].t()).squeeze().cpu()
         for perm in PermIterator(pos_test_edge.device, pos_test_edge.shape[0],
                                  batch_size, False)
     ],
                               dim=0)
 
     neg_test_pred = torch.cat([
-        predictor(h, adj, neg_test_edge[perm].t()).squeeze().cpu()
+        predict_edges(neg_test_edge[perm].t()).squeeze().cpu()
         for perm in PermIterator(neg_test_edge.device, neg_test_edge.shape[0],
                                  batch_size, False)
     ],
@@ -158,6 +171,7 @@ def test(model, predictor, data, split_edge, evaluator, batch_size,
 
 def parseargs():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--community_resolution',type=float,default=1.0)
     parser.add_argument('--use_valedges_as_input', action='store_true', help="whether to add validation edges to the input adjacency matrix of gnn")
     parser.add_argument('--epochs', type=int, default=40, help="number of epochs")
     parser.add_argument('--runs', type=int, default=3, help="number of repeated runs")
@@ -242,14 +256,17 @@ def main():
     device = torch.device(f'cuda' if torch.cuda.is_available() else 'cpu')
     data, split_edge = loaddataset(args.dataset, args.use_valedges_as_input, args.load)
     data = data.to(device)
-
     predfn = predictor_dict[args.predictor]
+    use_community = args.predictor == "tcrncnc"
     if args.predictor != "cn0":
         predfn = partial(predfn, cndeg=args.cndeg)
-    if args.predictor in ["cn1", "incn1cn1", "scn1", "catscn1", "sincn1cn1"]:
+    if args.predictor in ["cn1", "incn1cn1", "scn1", "catscn1", "sincn1cn1", "tcrncnc"]:
         predfn = partial(predfn, use_xlin=args.use_xlin, tailact=args.tailact, twolayerlin=args.twolayerlin, beta=args.beta)
-    if args.predictor == "incn1cn1":
-        predfn = partial(predfn, depth=args.depth, splitsize=args.splitsize, scale=args.probscale, offset=args.proboffset, trainresdeg=args.trndeg, testresdeg=args.tstdeg, pt=args.pt, learnablept=args.learnpt, alpha=args.alpha)
+    if args.predictor in ["incn1cn1", "tcrncnc"]:
+        predfn = partial(predfn, depth=args.depth, splitsize=args.splitsize,
+                         scale=args.probscale, offset=args.proboffset,
+                         trainresdeg=args.trndeg, testresdeg=args.tstdeg,
+                         pt=args.pt, learnablept=args.learnpt, alpha=args.alpha)
     
     ret = []
 
@@ -258,6 +275,15 @@ def main():
         if args.dataset in ["Cora", "Citeseer", "Pubmed"]:
             data, split_edge = loaddataset(args.dataset, args.use_valedges_as_input, args.load) # get a new split of dataset
             data = data.to(device)
+        community = None
+        if use_community:
+            community = build_sna_community(
+                edge_index=split_edge['train']['edge'].t(),
+                num_nodes=data.num_nodes,
+                device=device,
+                resolution=args.community_resolution,
+                seed=42 + run
+            )
         bestscore = None
         
         # build model
@@ -284,12 +310,12 @@ def main():
             alpha = max(0, min((epoch-5)*0.1, 1)) if args.increasealpha else None
             t1 = time.time()
             loss = train(model, predictor, data, split_edge, optimizer,
-                         args.batch_size, args.maskinput, [], alpha)
+                         args.batch_size, args.maskinput, [], alpha, community)
             print(f"trn time {time.time()-t1:.2f} s", flush=True)
             if True:
                 t1 = time.time()
                 results, h = test(model, predictor, data, split_edge, evaluator,
-                               args.testbs, args.use_valedges_as_input)
+                               args.testbs, args.use_valedges_as_input, community=community)
                 print(f"test time {time.time()-t1:.2f} s")
                 if bestscore is None:
                     bestscore = {key: list(results[key]) for key in results}

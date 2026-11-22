@@ -150,83 +150,59 @@ def spm2elem(spm: SparseTensor) -> Tensor:
     return elem
 
 
+def _element_membership(element1: Tensor, element2: Tensor):
+    """Return whether each element in element2 occurs in sorted element1,
+    together with its insertion index. Handles empty sparse tensors safely.
+    """
+    if element1.numel() == 0:
+        idx = torch.zeros_like(element2, dtype=torch.long)
+        return torch.zeros_like(element2, dtype=torch.bool), idx
+    idx = torch.searchsorted(element1, element2)
+    in_bounds = idx < element1.numel()
+    matched = torch.zeros_like(element2, dtype=torch.bool)
+    if in_bounds.any():
+        matched[in_bounds] = element1[idx[in_bounds]] == element2[in_bounds]
+    return matched, idx
+
+
 def spmoverlap_(adj1: SparseTensor, adj2: SparseTensor) -> SparseTensor:
-    '''
-    Compute the overlap of neighbors (rows in adj). The returned matrix is similar to the hadamard product of adj1 and adj2
-    '''
+    """Compute the element-wise overlap of two sparse adjacency matrices."""
     assert adj1.sizes() == adj2.sizes()
     element1 = spm2elem(adj1)
     element2 = spm2elem(adj2)
-
-    if element2.shape[0] > element1.shape[0]:
-        element1, element2 = element2, element1
-
-    idx = torch.searchsorted(element1[:-1], element2)
-    mask = (element1[idx] == element2)
-    retelem = element2[mask]
-    '''
-    nnz1 = adj1.nnz()
-    element = torch.cat((adj1.storage.row(), adj2.storage.row()), dim=-1)
-    element.bitwise_left_shift_(32)
-    element[:nnz1] += adj1.storage.col()
-    element[nnz1:] += adj2.storage.col()
-    
-    element = torch.sort(element, dim=-1)[0]
-    mask = (element[1:] == element[:-1])
-    retelem = element[:-1][mask]
-    '''
-
-    return elem2spm(retelem, adj1.sizes())
+    matched, _ = _element_membership(element1, element2)
+    return elem2spm(element2[matched], adj1.sizes())
 
 
 def spmnotoverlap_(adj1: SparseTensor,
                    adj2: SparseTensor) -> Tuple[SparseTensor, SparseTensor]:
-    '''
-    return elements in adj1 but not in adj2 and in adj2 but not adj1
-    '''
-    # assert adj1.sizes() == adj2.sizes()
+    """Return elements in adj1 but not adj2, and in adj2 but not adj1."""
+    assert adj1.sizes() == adj2.sizes()
     element1 = spm2elem(adj1)
     element2 = spm2elem(adj2)
-
-    idx = torch.searchsorted(element1[:-1], element2)
-    matchedmask = (element1[idx] == element2)
-
-    maskelem1 = torch.ones_like(element1, dtype=torch.bool)
-    maskelem1[idx[matchedmask]] = 0
-    retelem1 = element1[maskelem1]
-
-    retelem2 = element2[torch.logical_not(matchedmask)]
-    return elem2spm(retelem1, adj1.sizes()), elem2spm(retelem2, adj2.sizes())
+    matched2, idx2 = _element_membership(element1, element2)
+    keep1 = torch.ones_like(element1, dtype=torch.bool)
+    if matched2.any():
+        keep1[idx2[matched2]] = False
+    return (elem2spm(element1[keep1], adj1.sizes()),
+            elem2spm(element2[~matched2], adj2.sizes()))
 
 
 def spmoverlap_notoverlap_(
         adj1: SparseTensor,
         adj2: SparseTensor) -> Tuple[SparseTensor, SparseTensor, SparseTensor]:
-    '''
-    return elements in adj1 but not in adj2 and in adj2 but not adj1
-    '''
-    # assert adj1.sizes() == adj2.sizes()
+    """Return overlap, adj1-only elements, and adj2-only elements."""
+    assert adj1.sizes() == adj2.sizes()
     element1 = spm2elem(adj1)
     element2 = spm2elem(adj2)
-
-    if element1.shape[0] == 0:
-        retoverlap = element1
-        retelem1 = element1
-        retelem2 = element2
-    else:
-        idx = torch.searchsorted(element1[:-1], element2)
-        matchedmask = (element1[idx] == element2)
-
-        maskelem1 = torch.ones_like(element1, dtype=torch.bool)
-        maskelem1[idx[matchedmask]] = 0
-        retelem1 = element1[maskelem1]
-
-        retoverlap = element2[matchedmask]
-        retelem2 = element2[torch.logical_not(matchedmask)]
+    matched2, idx2 = _element_membership(element1, element2)
+    keep1 = torch.ones_like(element1, dtype=torch.bool)
+    if matched2.any():
+        keep1[idx2[matched2]] = False
     sizes = adj1.sizes()
-    return elem2spm(retoverlap,
-                    sizes), elem2spm(retelem1,
-                                     sizes), elem2spm(retelem2, sizes)
+    return (elem2spm(element2[matched2], sizes),
+            elem2spm(element1[keep1], sizes),
+            elem2spm(element2[~matched2], sizes))
 
 
 def adjoverlap(adj1: SparseTensor,
