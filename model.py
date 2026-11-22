@@ -793,16 +793,14 @@ class IncompleteCN1Predictor(CNLinkPredictor):
                         adj,
                         ei1,
                         filled1,
-                        depth - 1,
-                        community).flatten()
+                        depth - 1).flatten()
                     ei2 = torch.stack((tar_ei[0][potcn2[0]], potcn2[1]))
                     probcn2 = self.forward(
                         x,
                         adj,
                         ei2,
                         filled1,
-                        depth - 1,
-                        community).flatten()
+                        depth - 1).flatten()
                 else:
                     num1 = potcn1[1].shape[0]
                     ei1 = torch.stack((tar_ei[1][potcn1[0]], potcn1[1]))
